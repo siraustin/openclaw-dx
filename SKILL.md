@@ -1,6 +1,6 @@
 ---
 name: openclaw-dx
-version: 1.7.0
+version: 2.1.0
 license: MIT
 description: Diagnose and fix openclaw gateway issues. Use when the gateway is stuck, not starting, crash-looping, or rejecting connections. Covers main and --profile vesper gateways. Runs triage, applies fixes, writes incident report to ~/clawd/inbox.
 ---
@@ -413,6 +413,203 @@ cat ~/.openclaw/openclaw.json | python3 -c "import sys,json; c=json.load(sys.std
 - Local models via LM Studio — $0 but needs testing for summary quality
 **Prevention:** Avoid cross-provider compaction models that add auth overhead. Same-provider as primary model reduces failure modes. Monitor for `timed out during compaction` in err.log periodically.
 
+### 18. Self-Reinforcing Config.Patch Crash Loop (Post-Update / Post-Restart)
+**Symptom:** Gateway starts, runs for ~2 minutes, receives SIGTERM, LaunchAgent left unloaded. Repeats on every manual bootstrap. No config.patch visible in gateway logs (it happens too fast or logs rotate). Update to latest version does not fix it.
+**Diagnosis:** The agent's session preserves context about a pending config change (e.g., "fix auth order array"). On each restart, the agent resumes that intent and immediately issues a config.patch on `auth.*` keys, triggering a restart cascade. The gateway dies, gets re-bootstrapped, and the cycle repeats because the session still has the patching intent.
+```bash
+# 1. Check if sessions are bloated (session context preserves patching intent)
+python3 -c "
+import json
+data=json.load(open('$HOME/.openclaw/agents/main/sessions/sessions.json'))
+bloated=[k for k,v in data.items() if v.get('contextTokens',0)>=150000]
+print(f'Total: {len(data)}, Bloated: {len(bloated)}')
+for k in bloated[:5]: print(f'  {k}')
+"
+# 2. Check if plist was regenerated after update
+ls -la ~/Library/LaunchAgents/ai.openclaw.gateway.plist
+openclaw --version
+# If plist mtime is before the update, it's stale
+```
+**Distinguishing from #12 (Config Patch Restart Cascade):**
+- #12: One-time config.patch crash, manual bootstrap fixes it
+- #18: Bootstrap→crash→bootstrap loop because session context re-triggers config.patch on every restart
+**Fix:**
+```bash
+# 1. Regenerate plist for current version
+openclaw gateway install
+# 2. Prune bloated sessions (breaks the loop by clearing patching intent)
+python3 -c "
+import json
+path='$HOME/.openclaw/agents/main/sessions/sessions.json'
+data=json.load(open(path))
+healthy={k:v for k,v in data.items() if v.get('contextTokens',0)<150000}
+print(f'Pruning {len(data)-len(healthy)} bloated, keeping {len(healthy)} healthy')
+json.dump(healthy, open(path, 'w'), indent=2)
+"
+# 3. Bootstrap
+launchctl bootstrap gui/501 ~/Library/LaunchAgents/ai.openclaw.gateway.plist
+```
+**Prevention:**
+- Always run `openclaw gateway install` after `openclaw update` to regenerate the plist
+- Restrict agent's ability to config.patch `auth.*` keys without human confirmation
+- Session reset breaks the loop — if the gateway crashes >2 times in a row, prune sessions before next bootstrap
+
+### 19. Auto-Update Kills All Gateways Simultaneously
+**Symptom:** Both main AND vesper gateways go down at the same time. No reboot. No config changes. LaunchAgents left unloaded for both.
+**Diagnosis:** OpenClaw auto-updated to a new version. The package was replaced hours earlier but the deferred restart fired later, sending SIGTERM to all running gateway processes within seconds of each other. The `kickstart -k` fix from v2026.3.12 does NOT prevent this — auto-update restarts still leave LaunchAgents unloaded.
+```bash
+# 1. Confirm simultaneous SIGTERM
+grep 'signal SIGTERM received' ~/.openclaw/logs/gateway.log | tail -1
+grep 'signal SIGTERM received' ~/.openclaw-vesper/logs/gateway.log | tail -1
+# If timestamps are within ~10 seconds → auto-update
+
+# 2. Check version changed
+openclaw --version
+ls -la /opt/homebrew/lib/node_modules/openclaw/package.json  # mtime = update time
+```
+**Distinguishing from other failures:**
+- #12/#18: Single gateway, triggered by config.patch
+- #19: ALL gateways die within seconds, no config.patch in logs, version changed
+**Fix:**
+```bash
+# 1. Prune bloated sessions for all profiles
+for dir in ~/.openclaw ~/.openclaw-vesper; do
+  f="$dir/agents/main/sessions/sessions.json"
+  [ -f "$f" ] && python3 -c "
+import json
+path='$f'
+data=json.load(open(path))
+healthy={k:v for k,v in data.items() if v.get('contextTokens',0)<150000}
+pruned=len(data)-len(healthy)
+if pruned:
+    json.dump(healthy, open(path, 'w'), indent=2)
+    print(f'$(basename $dir): pruned {pruned}')
+"
+done
+# 2. Regenerate plists for new version
+openclaw gateway install --force
+openclaw --profile vesper gateway install --force
+# 3. Verify plist alignment (failure mode #14)
+grep OPENCLAW_STATE_DIR ~/Library/LaunchAgents/ai.openclaw.gateway.plist
+grep OPENCLAW_STATE_DIR ~/Library/LaunchAgents/ai.openclaw.vesper.plist
+# 4. Restart both
+launchctl bootout gui/501/ai.openclaw.gateway 2>/dev/null; launchctl bootstrap gui/501 ~/Library/LaunchAgents/ai.openclaw.gateway.plist
+launchctl bootout gui/501/ai.openclaw.vesper 2>/dev/null; launchctl bootstrap gui/501 ~/Library/LaunchAgents/ai.openclaw.vesper.plist
+```
+**Prevention:**
+- Disable auto-update if stability is critical: check `update.autoInstall` in `openclaw.json`
+- If auto-update is desired, add a post-update hook that runs `openclaw gateway install --force` for all profiles
+- Always follow the Post-Upgrade Checklist after any version change (manual or auto)
+
+### 20. Post-Upgrade Config Schema Breakage (Cascading Validation Failures)
+**Symptom:** After updating openclaw, CLI commands and `doctor` fail with `Config validation failed:` errors. The gateway may still run via LaunchAgent but CLI/TUI/doctor are broken. Multiple errors appear in sequence — fixing one reveals another.
+**Diagnosis:** Major version updates introduce stricter config validation. Old config entries from prior versions become invalid. Common patterns:
+- `models.providers.<provider>.baseUrl: expected string, received undefined` — provider auto-discovered from auth but missing required fields
+- `plugins.load.paths: plugin path not found` — extension removed in new version
+- `plugins.allow: plugin not found: <name>` — plugin renamed, removed, or became built-in channel
+- `plugins.entries.<name>: plugin not found` — stale plugin config from prior version
+```bash
+# 1. Identify all validation errors (may need to fix iteratively)
+openclaw doctor --fix 2>&1 | grep -i 'validation failed'
+
+# 2. Check for stale provider entries
+python3 -c "
+import json
+c=json.load(open('$HOME/.openclaw/openclaw.json'))
+for name,cfg in c.get('models',{}).get('providers',{}).items():
+    missing=[k for k in ['baseUrl','models'] if k not in cfg]
+    if missing: print(f'  {name}: missing {missing}')
+"
+
+# 3. Check for stale plugin references
+python3 -c "
+import json, os
+c=json.load(open('$HOME/.openclaw/openclaw.json'))
+for p in c.get('plugins',{}).get('load',{}).get('paths',[]):
+    if not os.path.exists(p): print(f'  stale path: {p}')
+for name in c.get('plugins',{}).get('entries',{}):
+    print(f'  entry: {name}')
+for name in c.get('plugins',{}).get('allow',[]):
+    print(f'  allow: {name}')
+for name in c.get('plugins',{}).get('installs',{}):
+    print(f'  install: {name}')
+"
+```
+**Fix:** Clean stale entries iteratively. Common fixes for v2026.3.22+:
+```bash
+python3 << 'PYEOF'
+import json, os
+
+for label, path in [('main', os.path.expanduser('~/.openclaw/openclaw.json')),
+                     ('vesper', os.path.expanduser('~/.openclaw-vesper/openclaw.json'))]:
+    c = json.load(open(path))
+    changed = False
+
+    # Fix: add required fields to auto-discovered providers
+    for name, cfg in c.get('models', {}).get('providers', {}).items():
+        if 'baseUrl' not in cfg:
+            # Known defaults per provider
+            defaults = {
+                'google': 'https://generativelanguage.googleapis.com/v1beta',
+            }
+            if name in defaults:
+                cfg['baseUrl'] = defaults[name]
+                cfg.setdefault('models', [])
+                changed = True
+                print(f'{label}: added baseUrl+models to {name} provider')
+
+    # Fix: remove stale plugin paths
+    paths = c.get('plugins', {}).get('load', {}).get('paths', [])
+    valid = [p for p in paths if os.path.exists(p)]
+    if len(valid) != len(paths):
+        c['plugins']['load']['paths'] = valid
+        changed = True
+
+    # Fix: remove stale plugin entries/installs
+    known_stale = ['google-gemini-cli-auth', 'acpx', 'memory-lancedb', 'memory-core']
+    for section in ['entries', 'installs']:
+        d = c.get('plugins', {}).get(section, {})
+        for s in known_stale:
+            if s in d:
+                del d[s]
+                changed = True
+                print(f'{label}: removed stale plugins.{section}.{s}')
+
+    # Fix: clean stale allow entries
+    allow = c.get('plugins', {}).get('allow', [])
+    cleaned = [a for a in allow if a not in known_stale]
+    if len(cleaned) != len(allow):
+        c['plugins']['allow'] = cleaned
+        changed = True
+
+    # Fix: clean stale plugins.slots.memory pointing to removed plugin
+    slots = c.get('plugins', {}).get('slots', {})
+    if slots.get('memory') in known_stale:
+        del slots['memory']
+        changed = True
+        print(f'{label}: removed stale plugins.slots.memory')
+
+    if changed:
+        json.dump(c, open(path, 'w'), indent=2)
+        print(f'{label}: config cleaned')
+PYEOF
+```
+**Known v2026.3.22 issues:**
+- `whatsapp` auto-added to `plugins.allow` by gateway but rejected by validator — non-blocking upstream bug, gateway runs fine
+- `models.providers.google` required when `google-gemini-cli` auth profile or `GEMINI_API_KEY` env exists
+- `acpx` extension path removed from bundled distribution
+- `nano-banana-pro` → google provider migration cascade: `doctor --fix` creates `models.providers.google` with `apiKey` but WITHOUT `baseUrl`, then validation fails. **Fix sequence matters: add `baseUrl` BEFORE running `doctor --fix`.**
+- `entry.js` → `index.js` entrypoint rename: every box needs plist regen (`gateway install --force`)
+- Skill path symlink tightening: `[skills] Skipping skill path that resolves outside its configured root` warnings for symlinked skills — non-blocking but noisy
+- `--profile` flag position changed: must be `openclaw --profile <name> <subcommand>`, NOT `openclaw <subcommand> --profile <name>`
+- `memory-core` plugin slot warning: `WARN: memory slot plugin not found or not marked as memory: memory-core` — remove stale `plugins.slots.memory` entry
+- Legacy Matrix encrypted state warning on boxes that previously had Matrix configured — ignorable unless Matrix is needed
+**Prevention:**
+- After upgrades, run `openclaw doctor --fix` iteratively until validation passes (or only non-blocking errors remain)
+- Each major update may introduce new required fields — check release notes
+- Keep provider entries minimal: only declare providers you actively use in the fallback chain
+- **Pre-fix google provider before running `doctor --fix`** if nano-banana-pro is configured: add `baseUrl` + `models` array first, then let doctor migrate the apiKey
+
 ## Memory Thresholds
 
 | RSS | Status | Action |
@@ -579,7 +776,55 @@ Run after any openclaw version bump:
 ```bash
 openclaw --version
 cp ~/.openclaw/openclaw.json ~/.openclaw/openclaw.json.pre-upgrade
-openclaw doctor --fix
+cp ~/.openclaw-vesper/openclaw.json ~/.openclaw-vesper/openclaw.json.pre-upgrade
+
+# PRE-FIX: If nano-banana-pro is configured, add google provider baseUrl BEFORE doctor --fix
+# (doctor --fix migrates nano-banana-pro apiKey → models.providers.google but omits baseUrl)
+for dir in ~/.openclaw ~/.openclaw-vesper; do
+  f="$dir/openclaw.json"
+  [ -f "$f" ] && python3 -c "
+import json
+c=json.load(open('$f'))
+sk=c.get('skills',{}).get('entries',{}).get('nano-banana-pro')
+if sk:
+    p=c.setdefault('models',{}).setdefault('providers',{}).setdefault('google',{})
+    p.setdefault('baseUrl','https://generativelanguage.googleapis.com/v1beta')
+    p.setdefault('models',[])
+    json.dump(c,open('$f','w'),indent=2)
+    print(f'$(basename $dir): pre-fixed google provider for nano-banana-pro migration')
+"
+done
+
+# Run doctor --fix ITERATIVELY until no validation errors (failure mode #20)
+# Each fix may reveal the next error — repeat until clean or only non-blocking errors remain
+openclaw doctor --fix 2>&1 | grep -i 'validation failed'
+# Common post-upgrade fixes: stale plugin entries, missing provider fields, removed extensions
+# See failure mode #20 for automated cleanup script
+
+# CRITICAL: Regenerate plist for new version (update does NOT do this automatically)
+openclaw gateway install --force
+# For vesper too:
+openclaw --profile vesper gateway install --force
+
+# Verify plists weren't cross-contaminated (failure mode #14)
+grep OPENCLAW_STATE_DIR ~/Library/LaunchAgents/ai.openclaw.gateway.plist
+grep OPENCLAW_STATE_DIR ~/Library/LaunchAgents/ai.openclaw.vesper.plist
+
+# Prune bloated sessions (prevents failure mode #18 crash loop)
+for dir in ~/.openclaw ~/.openclaw-vesper; do
+  f="$dir/agents/main/sessions/sessions.json"
+  [ -f "$f" ] && python3 -c "
+import json
+path='$f'
+data=json.load(open(path))
+healthy={k:v for k,v in data.items() if v.get('contextTokens',0)<150000}
+pruned=len(data)-len(healthy)
+if pruned:
+    json.dump(healthy, open(path, 'w'), indent=2)
+    print(f'$(basename $dir): pruned {pruned}')
+"
+done
+
 openclaw devices list --json | jq '.pending'
 # Approve any pending pairings
 openclaw channels status
