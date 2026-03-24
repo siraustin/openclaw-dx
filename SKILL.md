@@ -1,6 +1,6 @@
 ---
 name: openclaw-dx
-version: 2.1.0
+version: 2.2.0
 license: MIT
 description: Diagnose and fix openclaw gateway issues. Use when the gateway is stuck, not starting, crash-looping, or rejecting connections. Covers main and --profile vesper gateways. Runs triage, applies fixes, writes incident report to ~/clawd/inbox.
 ---
@@ -598,12 +598,19 @@ PYEOF
 - `whatsapp` auto-added to `plugins.allow` by gateway but rejected by validator — non-blocking upstream bug, gateway runs fine
 - `models.providers.google` required when `google-gemini-cli` auth profile or `GEMINI_API_KEY` env exists
 - `acpx` extension path removed from bundled distribution
-- `nano-banana-pro` → google provider migration cascade: `doctor --fix` creates `models.providers.google` with `apiKey` but WITHOUT `baseUrl`, then validation fails. **Fix sequence matters: add `baseUrl` BEFORE running `doctor --fix`.**
+- `nano-banana-pro` → google provider migration cascade: `doctor --fix` creates `models.providers.google` with `apiKey` but WITHOUT `baseUrl`, then validation fails. **Fix sequence matters: add `baseUrl` BEFORE running `doctor --fix`.** ⚠️ **Fixed in v2026.3.23** — `doctor` now handles this migration cleanly without pre-fixing.
 - `entry.js` → `index.js` entrypoint rename: every box needs plist regen (`gateway install --force`)
 - Skill path symlink tightening: `[skills] Skipping skill path that resolves outside its configured root` warnings for symlinked skills — non-blocking but noisy
 - `--profile` flag position changed: must be `openclaw --profile <name> <subcommand>`, NOT `openclaw <subcommand> --profile <name>`
 - `memory-core` plugin slot warning: `WARN: memory slot plugin not found or not marked as memory: memory-core` — remove stale `plugins.slots.memory` entry
 - Legacy Matrix encrypted state warning on boxes that previously had Matrix configured — ignorable unless Matrix is needed
+
+**v2026.3.23 upgrade improvements:**
+- `openclaw update` now runs `doctor` automatically as part of the update pipeline — no manual `doctor --fix` step needed
+- Google provider migration (baseUrl + models) handled cleanly by doctor — no pre-fix required
+- Brave search API key auto-migrated from `tools.web.search.apiKey` → `plugins.entries.brave.config.webSearch.apiKey`
+- Stale plugins (e.g., `google-gemini-cli-auth`) produce warnings but don't block startup
+- **Field-tested**: Clean 3.13 → 3.23-2 upgrade on Julia (Spark) — zero manual intervention, 24.8s total
 **Prevention:**
 - After upgrades, run `openclaw doctor --fix` iteratively until validation passes (or only non-blocking errors remain)
 - Each major update may introduce new required fields — check release notes
@@ -778,25 +785,25 @@ openclaw --version
 cp ~/.openclaw/openclaw.json ~/.openclaw/openclaw.json.pre-upgrade
 cp ~/.openclaw-vesper/openclaw.json ~/.openclaw-vesper/openclaw.json.pre-upgrade
 
-# PRE-FIX: If nano-banana-pro is configured, add google provider baseUrl BEFORE doctor --fix
-# (doctor --fix migrates nano-banana-pro apiKey → models.providers.google but omits baseUrl)
-for dir in ~/.openclaw ~/.openclaw-vesper; do
-  f="$dir/openclaw.json"
-  [ -f "$f" ] && python3 -c "
-import json
-c=json.load(open('$f'))
-sk=c.get('skills',{}).get('entries',{}).get('nano-banana-pro')
-if sk:
-    p=c.setdefault('models',{}).setdefault('providers',{}).setdefault('google',{})
-    p.setdefault('baseUrl','https://generativelanguage.googleapis.com/v1beta')
-    p.setdefault('models',[])
-    json.dump(c,open('$f','w'),indent=2)
-    print(f'$(basename $dir): pre-fixed google provider for nano-banana-pro migration')
-"
-done
+# NOTE: On v2026.3.23+, `openclaw update` runs doctor automatically.
+# The nano-banana-pro baseUrl pre-fix is no longer needed (doctor handles it).
+# On v2026.3.22 ONLY, uncomment the pre-fix block below:
+# for dir in ~/.openclaw ~/.openclaw-vesper; do
+#   f="$dir/openclaw.json"
+#   [ -f "$f" ] && python3 -c "
+# import json
+# c=json.load(open('$f'))
+# sk=c.get('skills',{}).get('entries',{}).get('nano-banana-pro')
+# if sk:
+#     p=c.setdefault('models',{}).setdefault('providers',{}).setdefault('google',{})
+#     p.setdefault('baseUrl','https://generativelanguage.googleapis.com/v1beta')
+#     p.setdefault('models',[])
+#     json.dump(c,open('$f','w'),indent=2)
+#     print(f'pre-fixed google provider for nano-banana-pro migration')
+# "
+# done
 
-# Run doctor --fix ITERATIVELY until no validation errors (failure mode #20)
-# Each fix may reveal the next error — repeat until clean or only non-blocking errors remain
+# Verify doctor ran clean (check for residual issues)
 openclaw doctor --fix 2>&1 | grep -i 'validation failed'
 # Common post-upgrade fixes: stale plugin entries, missing provider fields, removed extensions
 # See failure mode #20 for automated cleanup script
