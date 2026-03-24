@@ -1,6 +1,6 @@
 ---
 name: openclaw-dx
-version: 2.2.0
+version: 2.3.0
 license: MIT
 description: Diagnose and fix openclaw gateway issues. Use when the gateway is stuck, not starting, crash-looping, or rejecting connections. Covers main and --profile vesper gateways. Runs triage, applies fixes, writes incident report to ~/clawd/inbox.
 ---
@@ -777,6 +777,25 @@ After fixing any issue:
 <how to avoid next time>
 ```
 
+### 21. imageModel Not Configured (3.22+ Breaking Change)
+**Symptom:** `image` tool fails with "No media-understanding provider registered for anthropic" or similar.
+**Root cause:** OC 3.22+ separated image/vision understanding from the main model provider. Anthropic models no longer auto-register for media understanding.
+**Fix:** Set `agents.defaults.imageModel` in config:
+```json
+{
+  "agents": {
+    "defaults": {
+      "imageModel": {
+        "primary": "lmstudio/qwen/qwen3-vl-30b",
+        "fallbacks": ["google/gemini-2.5-flash"]
+      }
+    }
+  }
+}
+```
+**Options:** Any vision-capable model works: `google/gemini-2.5-flash` (cloud), `lmstudio/qwen/qwen3-vl-30b` (local, zero cost on M3 Ultra), `lmstudio/qwen/qwen3-vl-8b` (local, fits Mac Mini 16GB+).
+**Fleet impact:** All bots on 3.22+ need this if they use the `image` tool. Also applies to `pdfModel` (`agents.defaults.pdfModel`).
+
 ## Post-Upgrade Checklist
 
 Run after any openclaw version bump:
@@ -835,6 +854,21 @@ done
 openclaw devices list --json | jq '.pending'
 # Approve any pending pairings
 openclaw channels status
+
+# Verify imageModel configured (3.22+ requirement — see failure mode #21)
+for dir in ~/.openclaw ~/.openclaw-vesper; do
+  f="$dir/openclaw.json"
+  [ -f "$f" ] && python3 -c "
+import json
+c=json.load(open('$f'))
+im=c.get('agents',{}).get('defaults',{}).get('imageModel')
+name='$(basename $dir)'
+if im:
+    print(f'{name}: imageModel = {im.get(\"primary\",\"?\")}')
+else:
+    print(f'{name}: ⚠️ imageModel NOT SET — image tool will fail (see failure mode #21)')
+"
+done
 ```
 
 ## Vesper Profile Commands
