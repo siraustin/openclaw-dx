@@ -1,13 +1,13 @@
 ---
 name: openclaw-dx
-version: 2.3.0
+version: 2.4.0
 license: MIT
-description: Diagnose and fix openclaw gateway issues. Use when the gateway is stuck, not starting, crash-looping, or rejecting connections. Covers main and --profile vesper gateways. Runs triage, applies fixes, writes incident report to ~/clawd/inbox.
+description: Diagnose and fix OpenClaw gateway issues. Use when the gateway is stuck, not starting, crash-looping, or rejecting connections. Covers the default profile and named profiles. Runs triage, applies fixes, and documents incidents in a local report path.
 ---
 
 # OpenClaw Gateway DX
 
-Diagnose, fix, and document openclaw gateway issues. Covers both main (port 18789) and vesper profile (port 18999) gateways.
+Diagnose, fix, and document OpenClaw gateway issues. Covers the default profile and one or more named profiles.
 
 ## When to Use
 
@@ -22,11 +22,12 @@ Diagnose, fix, and document openclaw gateway issues. Covers both main (port 1878
 Run these in parallel to assess state:
 
 ```bash
+# Replace <main-port> / <profile-port> with the ports from your config or LaunchAgent.
 # 1. What's listening?
-lsof -i :18789 -i :18999 2>/dev/null | grep LISTEN
+lsof -i :<main-port> -i :<profile-port> 2>/dev/null | grep LISTEN
 
 # 2. Process health (memory, CPU, uptime)
-ps -o pid,rss,pcpu,lstart,etime -p $(lsof -i :18789 -t 2>/dev/null | head -1)
+ps -o pid,rss,pcpu,lstart,etime -p $(lsof -i :<main-port> -t 2>/dev/null | head -1)
 
 # 3. Recent errors
 tail -30 ~/.openclaw/logs/gateway.err.log
@@ -44,12 +45,12 @@ openclaw --version
 openclaw devices list --json | head -20
 
 # 8. Model config + fallback chain (use affected profile's config dir)
-# Main: ~/.openclaw/openclaw.json | Vesper: ~/.openclaw-vesper/openclaw.json
+# Default profile: ~/.openclaw/openclaw.json | Named profile: ~/.openclaw-<profile>/openclaw.json
 cat ~/.openclaw/openclaw.json | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin)['agents']['defaults']['model'], indent=2))"
 
 # 9. Per-agent auth token status + expiry check
-# Main: ~/.openclaw/agents/main/agent/auth-profiles.json
-# Vesper: ~/.openclaw-vesper/agents/main/agent/auth-profiles.json
+# Default profile: ~/.openclaw/agents/main/agent/auth-profiles.json
+# Named profile: ~/.openclaw-<profile>/agents/main/agent/auth-profiles.json
 python3 -c "
 import sys,json,time
 data=json.load(open('$HOME/.openclaw/agents/main/agent/auth-profiles.json'))
@@ -61,14 +62,14 @@ for k,v in data.get('profiles',{}).items():
     print(f'{k}: type={v.get(\"type\",\"?\")} token={has_token} expires={expired}')
 "
 
-# 10. Memory search / QMD (use --profile if vesper)
+# 10. Memory search / QMD (add --profile <profile> when checking a named profile)
 openclaw memory status
 
 # 11. Check OPENCLAW_GATEWAY_TOKEN env var (multi-profile foot-gun)
 echo "OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN:-unset}"
 
 # 12. Session token counts (context overflow check)
-for dir in ~/.openclaw ~/.openclaw-vesper; do
+for dir in ~/.openclaw ~/.openclaw-<profile>; do
   f="$dir/agents/main/sessions/sessions.json"
   [ -f "$f" ] && echo "=== $(basename $dir) ===" && python3 -c "
 import json
@@ -83,7 +84,7 @@ done
 
 # 12. Verify plist profile alignment
 grep OPENCLAW_STATE_DIR ~/Library/LaunchAgents/ai.openclaw.gateway.plist
-grep OPENCLAW_STATE_DIR ~/Library/LaunchAgents/ai.openclaw.vesper.plist
+grep OPENCLAW_STATE_DIR ~/Library/LaunchAgents/ai.openclaw.<profile>.plist
 ```
 
 ## Common Failure Modes
@@ -111,7 +112,7 @@ for k,v in data.get('profiles',{}).items():
     print(f'{k}: type={v.get(\"type\",\"?\")} token={has_token} expires={expired}')
 "
 ```
-**For OAuth expiry (OpenAI Codex):** `openclaw configure` (interactive re-auth). Add `--profile vesper` if vesper.
+**For OAuth expiry (OpenAI Codex):** `openclaw configure` (interactive re-auth). Add `--profile <profile>` if <profile>.
 **For missing provider keys (Google etc.):** `openclaw agents add <provider>` or remove unconfigured providers from fallback chain.
 **Prevention:** Ensure all providers in the fallback chain are actually configured. Use same-provider fallbacks (e.g. different Anthropic models) instead of cross-provider for predictable failure modes.
 
@@ -176,7 +177,7 @@ launchctl bootstrap gui/501 ~/Library/LaunchAgents/ai.openclaw.gateway.plist
 **Fix:** Remove the stale plugin entry from `~/.openclaw/openclaw.json`, then `openclaw gateway start`.
 
 ### 8. Port Conflict / Orphan Processes
-**Symptom:** `Port 18789 is already in use` or multiple gateway PIDs
+**Symptom:** `Port <main-port> is already in use` or multiple gateway PIDs
 **Fix:**
 ```bash
 ps aux | grep openclaw-gateway | grep -v grep
@@ -239,12 +240,12 @@ launchctl bootstrap gui/501 ~/Library/LaunchAgents/ai.openclaw.gateway.plist
 - If using the gateway tool's `config.patch` action, combine auth + plugin + compaction changes into one call
 
 ### 13. OPENCLAW_GATEWAY_TOKEN Env Var Overriding Multi-Profile Token Auth
-**Symptom:** `unauthorized: gateway token mismatch` on `openclaw --profile vesper` (or any non-default profile), even when `gateway.auth.token` and `gateway.remote.token` match in the profile's config. Main profile works fine.
+**Symptom:** `unauthorized: gateway token mismatch` on `openclaw --profile <profile>` (or any non-default profile), even when `gateway.auth.token` and `gateway.remote.token` match in the profile's config. The default profile works fine.
 **Diagnosis:** The CLI resolves auth tokens with this precedence:
 ```
 process.env.OPENCLAW_GATEWAY_TOKEN > gateway.remote.token (config)
 ```
-If `OPENCLAW_GATEWAY_TOKEN` is set in shell rc (`~/.zshrc`/`~/.bashrc`) to main's token, the CLI sends main's token to ALL profiles, including vesper — which has its own gateway.auth.token.
+If `OPENCLAW_GATEWAY_TOKEN` is set in shell rc (`~/.zshrc`/`~/.bashrc`) to main's token, the CLI sends main's token to ALL profiles, including <profile> — which has its own gateway.auth.token.
 **Fix:** Sync all profiles to use the same gateway auth token (matching `$OPENCLAW_GATEWAY_TOKEN`):
 ```bash
 # Check env var
@@ -255,11 +256,11 @@ echo $OPENCLAW_GATEWAY_TOKEN
 **Prevention:** When using `OPENCLAW_GATEWAY_TOKEN` env var with multi-profile setups, all profiles must use the same auth token value. The env var is profile-agnostic.
 
 ### 14. LaunchAgent Plist Overwritten to Wrong Profile
-**Symptom:** `unauthorized: gateway token mismatch` on main profile. Main gateway appears to be running (port listening) but uses wrong config. Vesper commands may work against main's port.
-**Diagnosis:** The `ai.openclaw.gateway.plist` was overwritten (likely by `openclaw --profile vesper gateway install` or agent config patches) to point all env vars to vesper's state dir. Check:
+**Symptom:** `unauthorized: gateway token mismatch` on the default profile. The default gateway appears to be running (port listening) but uses the wrong config. Named-profile commands may appear to hit the default profile's port.
+**Diagnosis:** The `ai.openclaw.gateway.plist` was overwritten (likely by `openclaw --profile <profile> gateway install` or agent config patches) to point all env vars to <profile>'s state dir. Check:
 ```bash
 grep OPENCLAW_STATE_DIR ~/Library/LaunchAgents/ai.openclaw.gateway.plist
-# Should show ~/.openclaw, NOT ~/.openclaw-vesper
+# Should show ~/.openclaw, NOT ~/.openclaw-<profile>
 grep OPENCLAW_PROFILE ~/Library/LaunchAgents/ai.openclaw.gateway.plist
 # Should NOT be present (main is the default profile)
 ```
@@ -269,7 +270,7 @@ grep OPENCLAW_PROFILE ~/Library/LaunchAgents/ai.openclaw.gateway.plist
 - Remove `OPENCLAW_PROFILE` key (main doesn't need it)
 - `StandardOutPath` → `~/.openclaw/logs/gateway.log`
 - `StandardErrorPath` → `~/.openclaw/logs/gateway.err.log`
-- `OPENCLAW_GATEWAY_PORT` → `18789`
+- `OPENCLAW_GATEWAY_PORT` → `<main-port>`
 - `OPENCLAW_LAUNCHD_LABEL` → `ai.openclaw.gateway`
 
 Then restart: `launchctl bootout gui/501/ai.openclaw.gateway && launchctl bootstrap gui/501 ~/Library/LaunchAgents/ai.openclaw.gateway.plist`
@@ -332,7 +333,7 @@ launchctl bootout gui/501/ai.openclaw.gateway && launchctl bootstrap gui/501 ~/L
 openclaw --profile <profile> channels status
 
 # 2. Check last session transcript entry — look for unanswered tool results
-tail -5 ~/.openclaw-vesper/agents/main/sessions/*.jsonl | python3 -c "
+tail -5 ~/.openclaw-<profile>/agents/main/sessions/*.jsonl | python3 -c "
 import sys, json
 for line in sys.stdin:
     line = line.strip()
@@ -356,13 +357,13 @@ grep 'cron: timer armed' /tmp/openclaw/openclaw-$(date +%Y-%m-%d).log | tail -1
 # 4. Check compaction model auth (misconfigured = compaction fails silently)
 python3 -c "
 import json
-c=json.load(open('$HOME/.openclaw-vesper/openclaw.json'))
+c=json.load(open('$HOME/.openclaw-<profile>/openclaw.json'))
 model=c.get('agents',{}).get('defaults',{}).get('compaction',{}).get('model','not set')
 print(f'Compaction model: {model}')
 provider=model.split('/')[0] if '/' in model else model
 # Check if provider has auth
 import os
-for d in ['.openclaw', '.openclaw-vesper']:
+for d in ['.openclaw', '.openclaw-<profile>']:
     p=os.path.expanduser(f'~/{d}/agents/main/agent/auth-profiles.json')
     if os.path.exists(p):
         data=json.load(open(p))
@@ -375,7 +376,7 @@ for d in ['.openclaw', '.openclaw-vesper']:
 - #16: Session tokens normal/low, no compaction errors, single API call hangs silently
 **Fix:** Restart the gateway:
 ```bash
-launchctl bootout gui/501/ai.openclaw.vesper && launchctl bootstrap gui/501 ~/Library/LaunchAgents/ai.openclaw.vesper.plist
+launchctl bootout gui/501/ai.openclaw.<profile> && launchctl bootstrap gui/501 ~/Library/LaunchAgents/ai.openclaw.<profile>.plist
 ```
 **Prevention:**
 - Ensure compaction model provider has valid auth (common: `google-gemini-cli` set but no gemini auth profile)
@@ -455,12 +456,12 @@ launchctl bootstrap gui/501 ~/Library/LaunchAgents/ai.openclaw.gateway.plist
 - Session reset breaks the loop — if the gateway crashes >2 times in a row, prune sessions before next bootstrap
 
 ### 19. Auto-Update Kills All Gateways Simultaneously
-**Symptom:** Both main AND vesper gateways go down at the same time. No reboot. No config changes. LaunchAgents left unloaded for both.
+**Symptom:** Both the default profile and one or more named profiles go down at the same time. No reboot. No config changes. LaunchAgents are left unloaded.
 **Diagnosis:** OpenClaw auto-updated to a new version. The package was replaced hours earlier but the deferred restart fired later, sending SIGTERM to all running gateway processes within seconds of each other. The `kickstart -k` fix from v2026.3.12 does NOT prevent this — auto-update restarts still leave LaunchAgents unloaded.
 ```bash
 # 1. Confirm simultaneous SIGTERM
 grep 'signal SIGTERM received' ~/.openclaw/logs/gateway.log | tail -1
-grep 'signal SIGTERM received' ~/.openclaw-vesper/logs/gateway.log | tail -1
+grep 'signal SIGTERM received' ~/.openclaw-<profile>/logs/gateway.log | tail -1
 # If timestamps are within ~10 seconds → auto-update
 
 # 2. Check version changed
@@ -473,7 +474,7 @@ ls -la /opt/homebrew/lib/node_modules/openclaw/package.json  # mtime = update ti
 **Fix:**
 ```bash
 # 1. Prune bloated sessions for all profiles
-for dir in ~/.openclaw ~/.openclaw-vesper; do
+for dir in ~/.openclaw ~/.openclaw-<profile>; do
   f="$dir/agents/main/sessions/sessions.json"
   [ -f "$f" ] && python3 -c "
 import json
@@ -488,13 +489,13 @@ if pruned:
 done
 # 2. Regenerate plists for new version
 openclaw gateway install --force
-openclaw --profile vesper gateway install --force
+openclaw --profile <profile> gateway install --force
 # 3. Verify plist alignment (failure mode #14)
 grep OPENCLAW_STATE_DIR ~/Library/LaunchAgents/ai.openclaw.gateway.plist
-grep OPENCLAW_STATE_DIR ~/Library/LaunchAgents/ai.openclaw.vesper.plist
+grep OPENCLAW_STATE_DIR ~/Library/LaunchAgents/ai.openclaw.<profile>.plist
 # 4. Restart both
 launchctl bootout gui/501/ai.openclaw.gateway 2>/dev/null; launchctl bootstrap gui/501 ~/Library/LaunchAgents/ai.openclaw.gateway.plist
-launchctl bootout gui/501/ai.openclaw.vesper 2>/dev/null; launchctl bootstrap gui/501 ~/Library/LaunchAgents/ai.openclaw.vesper.plist
+launchctl bootout gui/501/ai.openclaw.<profile> 2>/dev/null; launchctl bootstrap gui/501 ~/Library/LaunchAgents/ai.openclaw.<profile>.plist
 ```
 **Prevention:**
 - Disable auto-update if stability is critical: check `update.autoInstall` in `openclaw.json`
@@ -541,7 +542,7 @@ python3 << 'PYEOF'
 import json, os
 
 for label, path in [('main', os.path.expanduser('~/.openclaw/openclaw.json')),
-                     ('vesper', os.path.expanduser('~/.openclaw-vesper/openclaw.json'))]:
+                     ('<profile>', os.path.expanduser('~/.openclaw-<profile>/openclaw.json'))]:
     c = json.load(open(path))
     changed = False
 
@@ -610,7 +611,6 @@ PYEOF
 - Google provider migration (baseUrl + models) handled cleanly by doctor — no pre-fix required
 - Brave search API key auto-migrated from `tools.web.search.apiKey` → `plugins.entries.brave.config.webSearch.apiKey`
 - Stale plugins (e.g., `google-gemini-cli-auth`) produce warnings but don't block startup
-- **Field-tested**: Clean 3.13 → 3.23-2 upgrade on Julia (Spark) — zero manual intervention, 24.8s total
 **Prevention:**
 - After upgrades, run `openclaw doctor --fix` iteratively until validation passes (or only non-blocking errors remain)
 - Each major update may introduce new required fields — check release notes
@@ -634,9 +634,11 @@ The gateway runs on Node.js and defaults to ~4GB max old space. For long-running
 <string>--max-old-space-size=16384</string>
 ```
 
-Insert after the `node` binary path, before the entry JS file. Current state:
-- **vesper**: `--max-old-space-size=16384` (16GB) — set to handle QMD/memory-search workloads
-- **main**: not set (Node default ~4GB)
+Insert after the `node` binary path, before the entry JS file.
+
+Guidance:
+- Increase heap for profiles that run heavy memory-search or plugin workloads.
+- Start with the default and raise only when you have evidence of memory pressure.
 
 To add or change, edit the plist directly and reload:
 ```bash
@@ -652,8 +654,8 @@ If the gateway OOMs before hitting the RSS thresholds above, this is likely the 
 
 | Profile | Config | State | Port |
 |---------|--------|-------|------|
-| main | `~/.openclaw/openclaw.json` | `~/.openclaw/` | 18789 |
-| vesper | `~/.openclaw-vesper/openclaw.json` | `~/.openclaw-vesper/` | 18999 |
+| default | `~/.openclaw/openclaw.json` | `~/.openclaw/` | `<main-port>` |
+| <profile> | `~/.openclaw-<profile>/openclaw.json` | `~/.openclaw-<profile>/` | `<profile-port>` |
 
 **Plugin auto-discovery paths** (scanned on startup, no config entry needed):
 - `~/.openclaw/extensions/<plugin-id>/` — per-profile custom plugins
@@ -671,18 +673,18 @@ If the gateway OOMs before hitting the RSS thresholds above, this is likely the 
 Top-level `openclaw.json` auth.profiles declares profile type/mode only — **no tokens**.
 Actual tokens live in per-agent auth profile files:
 ```
-# Main profile
+# Default profile
 ~/.openclaw/agents/main/agent/auth-profiles.json
 ~/.openclaw/agents/codex/agent/auth-profiles.json
 
-# Vesper profile
-~/.openclaw-vesper/agents/main/agent/auth-profiles.json
-~/.openclaw-vesper/agents/codex/agent/auth-profiles.json
+# Named profile
+~/.openclaw-<profile>/agents/main/agent/auth-profiles.json
+~/.openclaw-<profile>/agents/codex/agent/auth-profiles.json
 ```
 Each has `profiles.<provider>:default` with `access`/`refresh`/`expires` for OAuth, or `token` for API keys.
 The `expires` field is epoch milliseconds — compare to `Date.now()` or `time.time()*1000` to check expiry.
 
-Fresh Anthropic setup tokens: `~/clawd/inbox/2026-03-03-anthropic-setup-tokens`
+Store setup tokens and recovery notes in your own secure local system. Do not publish those paths or values with the skill.
 
 ### doctor --fix Token Migration (v2026.3.1)
 `openclaw doctor --fix` removes `token` fields from top-level `auth.profiles` in `openclaw.json` (schema change). This does NOT affect per-agent auth profiles — those still use `token` as the field name. If doctor runs and removes tokens from the top-level config, the gateway still works because it reads from per-agent files at runtime.
@@ -690,7 +692,7 @@ Fresh Anthropic setup tokens: `~/clawd/inbox/2026-03-03-anthropic-setup-tokens`
 ### OpenAI Codex OAuth Refresh
 **Symptom:** `OAuth token refresh failed for openai-codex` or `refresh_token_reused` — the access token expired and the refresh token is single-use/already consumed.
 **Diagnosis:** Check `expires` field in `auth-profiles.json` — if epoch ms is in the past, access token is expired. If refresh also fails, full re-auth needed.
-**Fix:** Interactive re-auth: `openclaw configure` (add `--profile vesper` if vesper profile).
+**Fix:** Interactive re-auth: `openclaw configure` (add `--profile <profile>` for a named profile).
 
 ### Unconfigured Fallback Provider
 **Symptom:** `No API key found for provider "<provider>"` with auth store path shown.
@@ -701,7 +703,7 @@ Fresh Anthropic setup tokens: `~/clawd/inbox/2026-03-03-anthropic-setup-tokens`
 
 Check memory search status as part of triage when the agent isn't responding correctly:
 ```bash
-openclaw --profile vesper memory status
+openclaw --profile <profile> memory status
 ```
 Key config: `agents.defaults.memorySearch.enabled` in `openclaw.json` — if `false`, the `memory_search`/`memory_get` tools won't register even if listed in `tools.alsoAllow`.
 
@@ -711,13 +713,18 @@ Enabling requires a gateway restart (hot-reload picks up the config but tool reg
 
 `qmd` runs on **Node.js** (`#!/usr/bin/env node`), NOT Bun. The sqlite-vec extension loads fine under Node's `better-sqlite3`. Previous reports of "sqlite-vec/Bun" issues are a **red herring** for OpenClaw users.
 
+If `qmd` fails with `NODE_MODULE_VERSION` mismatch (e.g., after a Node.js upgrade):
+```bash
+cd /opt/homebrew/lib/node_modules/@tobilu/qmd && npm rebuild better-sqlite3 --build-from-source
+```
+
 If `qmd embed` hangs or fails:
 ```bash
 # 1. Check Homebrew SQLite is installed
 brew list sqlite
 
-# 2. Rebuild better-sqlite3 if needed
-npm rebuild better-sqlite3 --build-from-source
+# 2. Rebuild better-sqlite3 if needed (also fixes NODE_MODULE_VERSION errors)
+cd /opt/homebrew/lib/node_modules/@tobilu/qmd && npm rebuild better-sqlite3 --build-from-source
 # Note: npm v11 warns about --build-from-source but the flag still works (cosmetic warning)
 
 # 3. Check embedding status
@@ -740,8 +747,8 @@ Key commands for memory search triage:
 
 | Profile | LaunchAgent plist | Stop + Start |
 |---------|-------------------|--------------|
-| main | `~/Library/LaunchAgents/ai.openclaw.gateway.plist` | `openclaw gateway stop && launchctl bootstrap gui/501 ~/Library/LaunchAgents/ai.openclaw.gateway.plist` |
-| vesper | `~/Library/LaunchAgents/ai.openclaw.vesper.plist` | `openclaw --profile vesper gateway stop && launchctl bootstrap gui/501 ~/Library/LaunchAgents/ai.openclaw.vesper.plist` |
+| default | `~/Library/LaunchAgents/ai.openclaw.gateway.plist` | `openclaw gateway stop && launchctl bootstrap gui/501 ~/Library/LaunchAgents/ai.openclaw.gateway.plist` |
+| <profile> | `~/Library/LaunchAgents/ai.openclaw.<profile>.plist` | `openclaw --profile <profile> gateway stop && launchctl bootstrap gui/501 ~/Library/LaunchAgents/ai.openclaw.<profile>.plist` |
 
 If `gateway start` says "Gateway service not loaded", use `launchctl bootstrap` directly.
 
@@ -749,8 +756,8 @@ If `gateway start` says "Gateway service not loaded", use `launchctl bootstrap` 
 
 After fixing any issue:
 1. Verify: `openclaw channels status` — all channels should show "running"
-2. Check memory: `ps -o pid,rss,pcpu,etime -p $(lsof -i :18789 -t | head -1)`
-3. Write incident report to `~/clawd/inbox/YYYY-MM-DD-<description>.md`
+2. Check memory: `ps -o pid,rss,pcpu,etime -p $(lsof -i :<main-port> -t | head -1)`
+3. Write incident report to `./incident-reports/YYYY-MM-DD-<description>.md`
 
 ## Incident Report Template
 
@@ -796,18 +803,72 @@ After fixing any issue:
 **Options:** Any vision-capable model works: `google/gemini-2.5-flash` (cloud), `lmstudio/qwen/qwen3-vl-30b` (local, zero cost on M3 Ultra), `lmstudio/qwen/qwen3-vl-8b` (local, fits Mac Mini 16GB+).
 **Fleet impact:** All bots on 3.22+ need this if they use the `image` tool. Also applies to `pdfModel` (`agents.defaults.pdfModel`).
 
+### 22. QMD Collection Name Mismatch (Memory Search Silently Failing)
+**Symptom:** `qmd search ... -c tool-heuristics failed: Collection not found: tool-heuristics` in err.log. Gateway falls back to builtin index with `qmd memory failed; switching to builtin index`. Memory search produces degraded results.
+**Diagnosis:** The per-agent QMD naming convention appends `-<agent>` to collection names (e.g., `tool-heuristics-main`), but the gateway's memory search queries for the base name (`tool-heuristics`). The gateway tries to create `tool-heuristics`, fails because `tool-heuristics-main` already exists at the same path, then searches for `tool-heuristics` which doesn't exist.
+```bash
+# Check for the mismatch
+qmd collection list 2>&1 | grep tool-heuristics
+# If you see tool-heuristics-main but NOT tool-heuristics → mismatch
+```
+**Fix:**
+```bash
+# Remove the misnamed collection
+qmd collection remove tool-heuristics-main
+# Re-add with the name the gateway expects
+qmd collection add /path/to/tool-heuristics --name tool-heuristics --glob '**/*.md'
+qmd embed
+```
+**Prevention:** After manually creating QMD collections, use the base name (no agent suffix). The gateway expects `tool-heuristics`, not `tool-heuristics-main`.
+
+### 23. Cron Session Accumulation (Gradual Memory Bloat + Message Swallowing)
+**Symptom:** Messages swallowed, gateway RSS climbs steadily over days. Session token counts show dozens of `agent:main:cron:*` entries at 272K-1M tokens each. Main session may also be at 100%.
+**Diagnosis:** Cron jobs create new sessions for each run (`agent:main:cron:<id>:run:<run-id>`). These sessions accumulate and never get pruned. Combined with compaction failures (e.g., LCM summarizer timeouts), sessions grow to max size and stay there.
+```bash
+# Count cron sessions and their total token usage
+python3 -c "
+import json
+data=json.load(open('$HOME/.openclaw/agents/main/sessions/sessions.json'))
+cron=[k for k in data if ':cron:' in k]
+bloated=[k for k in cron if data[k].get('contextTokens',0)>=150000]
+total_tokens=sum(data[k].get('contextTokens',0) for k in cron)
+print(f'Cron sessions: {len(cron)} ({len(bloated)} bloated)')
+print(f'Total cron tokens: {total_tokens:,}')
+print(f'All sessions: {len(data)}')
+"
+```
+**Fix:** Prune all bloated sessions (same as #15 fix):
+```bash
+python3 -c "
+import json
+path='$HOME/.openclaw/agents/main/sessions/sessions.json'
+data=json.load(open(path))
+healthy={k:v for k,v in data.items() if v.get('contextTokens',0)<150000}
+print(f'Pruned {len(data)-len(healthy)}, keeping {len(healthy)}')
+json.dump(healthy, open(path, 'w'), indent=2)
+"
+launchctl bootout gui/501/ai.openclaw.gateway 2>/dev/null
+sleep 2
+launchctl bootstrap gui/501 ~/Library/LaunchAgents/ai.openclaw.gateway.plist
+```
+**Prevention:**
+- Ensure LCM compaction summarizer is configured and working (check for `summarizer timed out` in err.log)
+- Consider setting `contextPruning` with aggressive TTL for cron sessions
+- Monitor total session count — if >50, investigate accumulation
+- The LCM config `[lcm] Ignoring sessions matching 1 pattern(s): agent:*:cron:**` should prevent cron session compaction, but the sessions still accumulate in sessions.json
+
 ## Post-Upgrade Checklist
 
 Run after any openclaw version bump:
 ```bash
 openclaw --version
 cp ~/.openclaw/openclaw.json ~/.openclaw/openclaw.json.pre-upgrade
-cp ~/.openclaw-vesper/openclaw.json ~/.openclaw-vesper/openclaw.json.pre-upgrade
+cp ~/.openclaw-<profile>/openclaw.json ~/.openclaw-<profile>/openclaw.json.pre-upgrade
 
 # NOTE: On v2026.3.23+, `openclaw update` runs doctor automatically.
 # The nano-banana-pro baseUrl pre-fix is no longer needed (doctor handles it).
 # On v2026.3.22 ONLY, uncomment the pre-fix block below:
-# for dir in ~/.openclaw ~/.openclaw-vesper; do
+# for dir in ~/.openclaw ~/.openclaw-<profile>; do
 #   f="$dir/openclaw.json"
 #   [ -f "$f" ] && python3 -c "
 # import json
@@ -829,15 +890,15 @@ openclaw doctor --fix 2>&1 | grep -i 'validation failed'
 
 # CRITICAL: Regenerate plist for new version (update does NOT do this automatically)
 openclaw gateway install --force
-# For vesper too:
-openclaw --profile vesper gateway install --force
+# For a named profile too:
+openclaw --profile <profile> gateway install --force
 
 # Verify plists weren't cross-contaminated (failure mode #14)
 grep OPENCLAW_STATE_DIR ~/Library/LaunchAgents/ai.openclaw.gateway.plist
-grep OPENCLAW_STATE_DIR ~/Library/LaunchAgents/ai.openclaw.vesper.plist
+grep OPENCLAW_STATE_DIR ~/Library/LaunchAgents/ai.openclaw.<profile>.plist
 
 # Prune bloated sessions (prevents failure mode #18 crash loop)
-for dir in ~/.openclaw ~/.openclaw-vesper; do
+for dir in ~/.openclaw ~/.openclaw-<profile>; do
   f="$dir/agents/main/sessions/sessions.json"
   [ -f "$f" ] && python3 -c "
 import json
@@ -856,7 +917,7 @@ openclaw devices list --json | jq '.pending'
 openclaw channels status
 
 # Verify imageModel configured (3.22+ requirement — see failure mode #21)
-for dir in ~/.openclaw ~/.openclaw-vesper; do
+for dir in ~/.openclaw ~/.openclaw-<profile>; do
   f="$dir/openclaw.json"
   [ -f "$f" ] && python3 -c "
 import json
@@ -871,11 +932,11 @@ else:
 done
 ```
 
-## Vesper Profile Commands
+## Named Profile Commands
 
-Prefix all commands with `--profile vesper`:
+Prefix all commands with `--profile <profile>`:
 ```bash
-openclaw --profile vesper channels status
-openclaw --profile vesper gateway start
-openclaw --profile vesper doctor --fix
+openclaw --profile <profile> channels status
+openclaw --profile <profile> gateway start
+openclaw --profile <profile> doctor --fix
 ```
