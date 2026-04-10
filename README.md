@@ -19,7 +19,7 @@ cp SKILL.md ~/.openclaw/skills/openclaw-dx/
 ## What It Covers
 
 - **Triage protocol** — parallel diagnostic commands to assess gateway state
-- **15 failure modes** with symptoms, diagnosis, and fixes:
+- **21 failure modes** with symptoms, diagnosis, and fixes:
   - Failover cascade (all providers down)
   - Expired channel tokens
   - Config wiped by upgrade
@@ -39,6 +39,7 @@ cp SKILL.md ~/.openclaw/skills/openclaw-dx/
 - **Auth reference** — token locations, doctor --fix behavior, OAuth refresh
 - **Post-fix protocol** and incident report template
 - **Post-upgrade checklist**
+- **Portable profile placeholders** so you can adapt the commands to your own named profiles and ports
 
 ## License
 

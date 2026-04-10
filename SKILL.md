@@ -62,10 +62,26 @@ for k,v in data.get('profiles',{}).items():
     print(f'{k}: type={v.get(\"type\",\"?\")} token={has_token} expires={expired}')
 "
 
-# 10. Memory search / QMD (add --profile <profile> when checking a named profile)
+# 10. Auth override check — agent auth files trump openclaw.json!
+# CRITICAL: auth-state.json in agent dir is the REAL runtime auth source.
+# If openclaw.json says austin-post but auth-state.json says austlin-gmail, the bot uses austlin-gmail.
+python3 -c "
+import json,os,glob
+for d in glob.glob(os.path.expanduser('~/.openclaw*/agents/*/agent')):
+    state = os.path.join(d, 'auth-state.json')
+    if os.path.exists(state):
+        data = json.load(open(state))
+        order = data.get('order', {}).get('anthropic', [])
+        good = data.get('lastGood', {}).get('anthropic', '?')
+        print(f'{state}:')
+        print(f'  order: {order}')
+        print(f'  lastGood: {good}')
+"
+
+# 11. Memory search / QMD (add --profile <profile> when checking a named profile)
 openclaw memory status
 
-# 11. Check OPENCLAW_GATEWAY_TOKEN env var (multi-profile foot-gun)
+# 12. Check OPENCLAW_GATEWAY_TOKEN env var (multi-profile foot-gun)
 echo "OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN:-unset}"
 
 # 12. Session token counts (context overflow check)
@@ -299,31 +315,42 @@ Key log signatures:
 - `embedded run timeout: runId=... timeoutMs=600000` — compaction timed out at 600s
 - `using current snapshot: timed out during compaction` — session remains at bloated size
 - `typing TTL reached` — bot received message, started typing, but agent never responded
-**Fix:** Reset the bloated session:
+**Fix:** Prune ONLY disposable sessions (cron + subagent). NEVER delete DM, group, or channel sessions.
 ```bash
-# 1. Find the session transcript
-ls -la ~/.openclaw/agents/main/sessions/*.jsonl
-# 2. Rename transcript to trigger reset
-TIMESTAMP=$(date -u +%Y-%m-%dT%H-%M-%S.000Z)
-mv ~/.openclaw/agents/main/sessions/<session-id>.jsonl \
-   ~/.openclaw/agents/main/sessions/<session-id>.jsonl.reset.$TIMESTAMP
-# 3. Remove session entry from sessions.json
+# ⚠️  CRITICAL: Archive sessions.json BEFORE any modification
+mkdir -p ~/.openclaw/session-archives/$(date +%Y-%m-%d)
+cp ~/.openclaw/agents/main/sessions/sessions.json \
+   ~/.openclaw/session-archives/$(date +%Y-%m-%d)/main-sessions-pre-prune.json
+
+# Prune ONLY cron and subagent sessions (disposable)
 python3 -c "
-import json
-path='$HOME/.openclaw/agents/main/sessions/sessions.json'
-data=json.load(open(path))
-# Delete the bloated session entry (e.g., 'agent:main:main')
-del data['agent:main:main']
-json.dump(data, open(path, 'w'), indent=2)
+import json, os
+path = os.path.expanduser('~/.openclaw/agents/main/sessions/sessions.json')
+data = json.load(open(path))
+original = len(data)
+pruned = {k: v for k, v in data.items() if ':cron:' not in k and ':subagent:' not in k}
+print(f'Kept {len(pruned)}/{original} sessions (removed {original - len(pruned)} cron/subagent)')
+json.dump(pruned, open(path, 'w'), indent=2)
 "
-# 4. Restart gateway
+# Restart gateway
 launchctl bootout gui/501/ai.openclaw.gateway && launchctl bootstrap gui/501 ~/Library/LaunchAgents/ai.openclaw.gateway.plist
 ```
+
+> **🚨 SESSION DELETION POLICY (HARD RULE)**
+> - **NEVER delete** DM sessions (`:direct:`, `:telegram:direct:`, `:telegram:slash:`, `:main`)
+> - **NEVER delete** group chat sessions (`:telegram:group:`, `:slack:channel:`, `:discord:`)
+> - **NEVER delete** any session containing user conversation history
+> - **OK to prune:** cron sessions (`:cron:`) and subagent sessions (`:subagent:`)
+> - **ALWAYS archive** the full `sessions.json` before ANY modification
+> - Archive path: `~/.openclaw/session-archives/YYYY-MM-DD/`
+> - Session history must be fully reconstructable — conversations are permanent records
+
 **Prevention:**
 - Ensure `contextPruning` is configured on ALL profiles: `{ "mode": "cache-ttl", "ttl": "1h", "keepLastAssistants": 5 }`
 - Monitor session token counts — alert when any session exceeds 150K (75%)
 - Consider periodic `/reset` for long-running persistent sessions (weekly)
 - `typing TTL reached` + provider-agnostic failures = session bloat, not provider issue
+- When diagnosing bloat, count sessions by type first — the fix is usually pruning crons, not deleting conversations
 
 ### 16. Agent Stuck on Hung API Call (Lane Deadlock Without Errors)
 **Symptom:** Messages received but never responded to. No errors in logs. No `lane wait exceeded`. No `typing TTL reached` for the stuck call. Gateway process healthy, event loop alive (cron timers firing). Channel status shows `in: Xm ago` but `out: Ym ago` where Y >> X.
